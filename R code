@@ -1,0 +1,1148 @@
+# MASTER REPRODUCIBLE R SCRIPT
+# District-Level Small Area Estimation of Youth Unemployment in Uttar Pradesh
+# Source: user-provided R scripts
+# Workflow
+# 01. PLFS import and youth/labour-force indicator construction
+# 02. Direct district-level estimates and survey variance
+# 03. District-name matching and analysis dataset
+# 04. Descriptive statistics and diagnostics
+# 05. Fay–Herriot (FH) model
+# 06. Spatial boundary and Queen-contiguity weights
+# 07. Spatial Fay–Herriot (SFH) model
+# 08. Bayesian spatial INLA-BYM2 model
+# 09. District-level maps and model-comparison plots
+# 10. Parametric bootstrap: FH
+# 11. Parametric bootstrap: SFH
+# 12. Bootstrap comparison and final output
+# NOTE: Install all the library and packages
+library(dplyr)
+library(readr)
+library(readxl)
+library(survey)
+library(sae)
+library(ggplot2)
+library(tidyr)
+library(tibble)
+
+plfs <- read_csv("C:/Users/RS Lab 2026-2/Desktop/PLFS.csv")
+colnames(plfs)
+
+
+#Identify the correct state code for Uttar Pradesh 
+unique_states <- unique(plfs$State_UT_Code)
+print(unique_states)   # Look for 9, 33, or whatever code represents UP
+up_code <- 9           # Change this to the correct code from the print output
+
+# Define activity status codes
+# Check the distribution of CWS_Status_Code to confirm the codes present
+table(plfs$CWS_Status_Code)
+
+# Based on typical PLFS coding:
+employed_codes <- c(11, 12, 21, 31, 41)   # Employed
+unemployed_codes <- c(51)                # Unemployed (only 51 in your data)
+labour_force_codes <- c(employed_codes, unemployed_codes)  # All in labour force
+
+#Filter and create indicators
+plfs_up <- plfs %>%
+  filter(State_UT_Code == up_code) %>%
+  mutate(
+    youth = ifelse(Age >= 15 & Age <= 29, 1, 0),
+    is_labour_force = ifelse(CWS_Status_Code %in% labour_force_codes, 1, 0),
+    is_unemployed    = ifelse(CWS_Status_Code %in% unemployed_codes, 1, 0)
+  ) %>%
+  filter(youth == 1)   # Keep only youth
+
+
+#Check that we have data
+if(nrow(plfs_up) == 0) stop("No youth data for UP. Check state code and youth definition.")
+print(table(plfs_up$District_Code))  # Show distribution across districts
+
+#Set survey design options to handle lonely PSUs
+options(survey.lonely.psu = "adjust")
+
+plfs_design <- svydesign(
+  ids     = ~FSU,
+  strata  = ~interaction(Stratum, Sub_Stratum),
+  weights = ~Subsample_Multiplier,
+  data    = plfs_up,
+  nest    = TRUE
+)
+
+#Compute direct estimates and design variances per district
+direct_estimates <- svyby(
+  formula     = ~is_unemployed,
+  by          = ~District_Code,
+  design      = plfs_design,
+  FUN         = svyratio,
+  denominator = ~is_labour_force,
+  keep.names  = FALSE,
+  vartype     = c("se", "var")
+)
+head(direct_estimates)
+# Transform to percentage
+direct_pct <- direct_estimates %>%
+  dplyr::mutate(
+    # Multiply estimate by 100
+    unemployment_pct =
+      `is_unemployed/is_labour_force` * 100,
+    
+    # Multiply SE by 100
+    se_pct =
+      `se.is_unemployed/is_labour_force` * 100,
+    
+    # Multiply variance by 100^2 = 10000
+    var_pct =
+      `var.is_unemployed/is_labour_force` * 10000
+  ) %>%
+  dplyr::select(
+    District_Code,
+    unemployment_pct,
+    se_pct,
+    var_pct
+  )
+print(direct_pct)
+# Check sample sizes per district
+district_sample_size <- plfs_up %>%
+  dplyr::filter(is_labour_force == 1) %>%
+  dplyr::group_by(District_Code) %>%
+  dplyr::summarise(
+    n_labour_force = dplyr::n(),
+    .groups = "drop"
+  )
+district_sample_size
+head(direct_pct)
+str(direct_pct$District_Code)
+
+library(readxl)
+library(dplyr)
+
+# Read the district code file
+district_names <- read_excel("C:/Users/RS Lab 2026-2/Desktop/District Code.xlsx")  
+str(district_names$District_Code)
+str(district_names$State_UT_Code)
+district_names$District_Code <- as.numeric(district_names$District_Code)
+district_names$State_UT_Code <- as.numeric(district_names$State_UT_Code)
+# Filter for Uttar Pradesh (State_UT_Code ==9)
+up_districts <- district_names %>%
+  dplyr::filter(State_UT_Code ==09) %>%
+  dplyr::select(
+    District_Code,
+    District_Name
+  )
+str(up_districts)
+
+# Merge with your direct estimates (assuming direct_pct already exists)
+final_with_names <- direct_pct %>%
+  dplyr::left_join(
+    up_districts,
+    by = "District_Code"
+  ) %>%
+  dplyr::select(
+    District_Code,
+    District_Name,
+    unemployment_pct,
+    se_pct,
+    var_pct
+  )
+final_with_names <- direct_pct %>%
+  dplyr::left_join(
+    up_districts,
+    by = "District_Code"
+  ) %>%
+  dplyr::mutate(
+    Direct_UR = unemployment_pct,
+    SE = se_pct,
+    Var = var_pct,
+    CV = 100 * SE / abs(Direct_UR)
+  ) %>%
+  dplyr::select(
+    District_Code,
+    District_Name,
+    Direct_UR,
+    SE,
+    Var,
+    CV
+  )
+print(final_with_names)
+str(final_with_names)
+# View
+head(final_with_names)
+
+
+final_data <- read_excel("C:/Users/RS Lab 2026-2/Desktop/Direct UR with Aux. Variables.xlsx")
+final_data
+str(final_data)
+final_data <- final_data %>%
+  mutate(
+    Direct_UR = as.numeric(Direct_UR),
+    Direct_Var       = as.numeric(Direct_Var),
+    Direct_SE=as.numeric(Direct_SE),
+    Direct_CV=as.numeric(Direct_CV)
+    
+  )
+
+fh_data <- final_data %>%
+  filter(
+    !is.na(Direct_UR),
+    !is.na(Direct_Var)
+  )
+fh_data
+nrow(fh_data)
+str(fh_data)
+library(ggplot2)
+
+ggplot(fh_data,
+       aes(Direct_UR))+
+  geom_histogram(
+    bins=12,
+    fill="steelblue",
+    colour="black"
+  )+
+  theme_minimal(base_size=14)
+library(corrplot)
+
+X <- fh_data %>%
+  dplyr::select(
+    Mean_NTL,
+    Urbanization_Rate,
+    Total_Literacy,
+    SC_Proportion,
+    ST_Proportion,
+    MGNREGA_Intensity,
+    Active_Worker_Rate
+  )
+
+cor_mat <- cor(X)
+
+corrplot(
+  cor_mat,
+  method="color",
+  type="upper",
+  tl.cex=0.8
+)
+library(car)
+
+lm1 <- lm(
+  Direct_UR ~
+    Mean_NTL +
+    Urbanization_Rate+
+    Total_Literacy+
+    SC_Proportion+
+    ST_Proportion+
+    MGNREGA_Intensity+
+    Active_Worker_Rate,
+  data=fh_data
+)
+vif(lm1)
+qqnorm(residuals(lm1))
+qqline(residuals(lm1),
+       col="red")
+shapiro.test(residuals(lm1))
+boxplot(final_data$Direct_UR,
+        horizontal = TRUE,
+        col = "skyblue",
+        main = "Boxplot of Direct Youth Unemployment Rate")
+
+library(sae)
+class(fh_data$Direct_Var)
+sum(is.na(fh_data$Direct_Var))
+is.numeric(fh_data$Direct_Var)
+fh_data$Direct_Var
+# Check that there are no NAs introduced (warnings)
+# If any NA appears, check for non‑numeric characters like commas or spaces.
+
+fh_data_df <- as.data.frame(fh_data)
+
+fh_model <- sae::eblupFH(
+  Direct_UR ~
+    Mean_NTL +
+    Urbanization_Rate +
+    Total_Literacy +
+    SC_Proportion +
+    ST_Proportion +
+    MGNREGA_Intensity +
+    Active_Worker_Rate,
+  vardir = Direct_Var,
+  data = fh_data_df
+)
+fh_mse <- sae::mseFH(
+  Direct_UR ~
+    Mean_NTL +
+    Urbanization_Rate +
+    Total_Literacy +
+    SC_Proportion +
+    ST_Proportion +
+    MGNREGA_Intensity +
+    Active_Worker_Rate,
+  vardir = Direct_Var,
+  data = fh_data_df
+)
+summary(fh_model)
+
+fh_model$eblup
+fh_data_df$FH_Estimate <- fh_model$eblup
+fh_data_df$FH_MSE <- fh_mse$mse
+
+head(fh_data_df)
+fh_model$fit
+beta_hat <- fh_model$fit$estcoef$beta
+names(beta_hat) <- rownames(fh_model$fit$estcoef)
+X <- model.matrix(
+  ~ Mean_NTL +
+    Urbanization_Rate +
+    Total_Literacy +
+    SC_Proportion +
+    ST_Proportion +
+    MGNREGA_Intensity +
+    Active_Worker_Rate,
+  data = final_data
+)
+Synthetic_FH <- as.vector(X %*% beta_hat)
+Synthetic_FH
+final_data$Synthetic_FH<- Synthetic_FH
+
+FH_data= read_excel("C:/Users/RS Lab 2026-2/Desktop/FH estimator.xlsx")
+str(FH_data) 
+FH_data <- FH_data %>%
+  mutate(
+    across(c(Direct_UR, Direct_SE, Direct_Var, Direct_CV, FH_Estimate, FH_MSE,FH_RMSE,FH_CV,Synthetic_Estimate), ~ round(as.numeric(.), 2))
+  )
+str(FH_data)
+library(sf)
+library(spdep)
+library(sae)
+library(dplyr)
+library(Matrix)  
+india <- st_read(
+  "C:/Users/RS Lab 2026-2/Downloads/gadm41_IND_shp/gadm41_IND_2.shp"
+)
+
+up_shp <- india %>%
+  filter(NAME_1=="Uttar Pradesh")
+nrow(up_shp)
+up_shp <- up_shp %>%
+  mutate(District_Name=NAME_2)
+setdiff(FH_data$District_Name,
+        up_shp$District_Name)
+
+setdiff(up_shp$District_Name,
+        FH_data$District_Name)
+up_shp <- up_shp[
+  match(FH_data$District_Name,
+        up_shp$District_Name),
+]
+# Source check from original script; Name_2 is not the created field.
+# Use District_Name, which was created from NAME_2 above.
+# all(up_shp$District_Name == final_data$District_Name)
+nb <- poly2nb(
+  up_shp,
+  queen=TRUE
+)
+summary(nb)
+plot(st_geometry(up_shp))
+
+plot(
+  nb,
+  st_coordinates(
+    st_centroid(up_shp)
+  ),
+  add=TRUE,
+  col="red"
+)
+lw <- nb2listw(
+  nb,
+  style="W",
+  zero.policy=TRUE
+)
+W <- listw2mat(lw)
+dim(W)
+rowSums(W)
+sample_idx <- !is.na(FH_data$Direct_UR)
+
+sfh_data <- FH_data[sample_idx,]
+nrow(sfh_data)
+W_sample <- W[
+  sample_idx,
+  sample_idx
+]
+rowSums(W_sample)
+dim(W_sample)
+sfh_data_df <- as.data.frame(sfh_data)
+
+sfh_model <- sae::eblupSFH(
+  
+  Direct_UR ~
+    
+    Mean_NTL +
+    
+    Urbanization_Rate +
+    
+    Total_Literacy +
+    
+    SC_Proportion +
+    
+    ST_Proportion +
+    
+    MGNREGA_Intensity +
+    
+    Active_Worker_Rate,
+  
+  vardir=Direct_Var,
+  
+  proxmat=W_sample,
+  
+  method="REML",
+  
+  data=sfh_data_df
+)
+sfh_mse <- sae::mseSFH(
+  
+  Direct_UR ~
+    
+    Mean_NTL +
+    
+    Urbanization_Rate +
+    
+    Total_Literacy +
+    
+    SC_Proportion +
+    
+    ST_Proportion +
+    
+    MGNREGA_Intensity +
+    
+    Active_Worker_Rate,
+  
+  vardir=Direct_Var,
+  
+  proxmat=W_sample,
+  
+  method="REML",
+  
+  data=sfh_data_df
+)
+sfh_mse$mse
+sfh_model$fit
+
+library(INLA)
+library(sf)
+library(spdep)
+library(dplyr)
+library(Matrix)
+table(card(nb))
+nb2INLA(
+  "UP.graph",
+  nb
+)
+g <- inla.read.graph(
+  filename="UP.graph"
+)
+g
+FH_data$District_Code <-
+  1:nrow(FH_data)
+summary(FH_data$Direct_UR)
+FH_data$precision <-
+  1/FH_data$Direct_Var
+FH_data$precision[
+  is.na(FH_data$Direct_UR)
+] <- 0
+formula <-
+  
+  Direct_UR ~
+  
+  Mean_NTL +
+  
+  Urbanization_Rate +
+  
+  Total_Literacy +
+  
+  SC_Proportion +
+  
+  ST_Proportion +
+  
+  MGNREGA_Intensity +
+  
+  Active_Worker_Rate +
+  
+  f(
+    District_Code,
+    model="bym2",
+    graph=g
+  )
+result <-
+  
+  inla(
+    
+    formula,
+    
+    family="gaussian",
+    
+    data=FH_data,
+    
+    control.family=list(
+      
+      hyper=list(
+        
+        prec=list(
+          
+          initial=log(1),
+          
+          fixed=TRUE
+          
+        )
+        
+      )
+      
+    ),
+    
+    control.predictor=list(
+      
+      compute=TRUE
+      
+    ),
+    
+    control.compute=list(
+      
+      dic=TRUE,
+      
+      waic=TRUE,
+      
+      cpo=TRUE
+      
+    ),
+    
+    scale=FH_data$precision
+    
+  )
+FH_data$INLA_Estimate <-
+  result$summary.fitted.values$mean
+FH_data$Posterior_SD <-
+  result$summary.fitted.values$sd
+FH_data$Lower95 <-
+  result$summary.fitted.values$`0.025quant`
+
+FH_data$Upper95 <-
+  result$summary.fitted.values$`0.975quant`
+FH_data$Posterior_MSE <-
+  
+  FH_data$Posterior_SD^2
+
+FH_data$INLA_CV <-
+  
+  100*
+  
+  FH_data$Posterior_SD/
+  
+  FH_data$INLA_Estimate
+str(FH_data)
+
+# Bootstrap Estimates and MSE
+final_data= read_excel("C:/Users/RS Lab 2026-2/Desktop/Estimates of Direct, FH,SFH,INLA with MSE and CVs.xlsx")
+str(final_data)
+final_data <- final_data %>%
+  mutate(
+    across(c(Direct_UR,Direct_SE, Direct_Var, Direct_CV,FH_Estimate, FH_MSE, FH_RMSE,FH_CV, SFH_Estimate, SFH_MSE, SFH_RMSE,SFH_CV), ~ round(as.numeric(.), 2))
+  )
+str(final_data) 
+final_data_df <- as.data.frame(final_data)
+
+# FH PARAMETRIC BOOTSTRAP
+
+
+library(sae)
+library(dplyr)
+
+# Analysis data: districts with direct estimates
+fh_data <- final_data %>%
+  dplyr::filter(
+    !is.na(Direct_UR),
+    !is.na(Direct_Var)
+  )
+str(fh_data$Direct_Var)
+fh_data_df <- as.data.frame(fh_data)
+m <- nrow(fh_data_df)        # sampled districts
+M <- nrow(final_data_df)     # total districts
+
+
+
+fh_model <- sae::eblupFH(
+  Direct_UR ~
+    Mean_NTL +
+    Urbanization_Rate +
+    Total_Literacy +
+    SC_Proportion +
+    ST_Proportion +
+    MGNREGA_Intensity +
+    Active_Worker_Rate,
+  vardir = Direct_Var,
+  data = fh_data_df
+)
+
+
+beta_hat <- fh_model$fit$estcoef$beta
+
+names(beta_hat) <-
+  rownames(fh_model$fit$estcoef)
+
+sigma_u2 <- fh_model$fit$refvar
+
+# Design matrix for all districts
+X_all <- model.matrix(
+  ~ Mean_NTL +
+    Urbanization_Rate +
+    Total_Literacy +
+    SC_Proportion +
+    ST_Proportion +
+    MGNREGA_Intensity +
+    Active_Worker_Rate,
+  data = final_data_df
+)
+
+theta_hat <- as.vector(
+  X_all %*% beta_hat
+)
+
+# Direct-estimate variances
+D <- as.numeric(
+  fh_data_df$Direct_Var
+)
+
+# Sampled districts
+sample_index <- which(
+  !is.na(final_data_df$Direct_UR)
+)
+
+# Check
+length(D)
+m
+length(sample_index)
+M
+
+# Bootstrap settings
+
+B <- 500
+
+Theta_boot_matrix <- matrix(
+  NA,
+  nrow = M,
+  ncol = B
+)
+
+FH_boot_matrix <- matrix(
+  NA,
+  nrow = M,
+  ncol = B
+)
+
+set.seed(1234)
+
+# Bootstrap loop
+
+for (b in 1:B) {
+  
+  # Random area effects
+  u_boot <- rnorm(
+    M,
+    mean = 0,
+    sd = sqrt(sigma_u2)
+  )
+  
+  # True area-level values
+  theta_boot <- theta_hat + u_boot
+  
+  Theta_boot_matrix[, b] <-
+    theta_boot
+  
+  # Sampling errors
+  e_boot <- rnorm(
+    m,
+    mean = 0,
+    sd = sqrt(D)
+  )
+  
+  # Bootstrap direct estimates
+  y_boot <-
+    theta_boot[sample_index] +
+    e_boot
+  
+  # Bootstrap dataset
+  boot_data <- fh_data_df
+  
+  boot_data$Direct_UR <-
+    y_boot
+  
+  boot_model <- sae::eblupFH(
+    
+    Direct_UR ~
+      Mean_NTL +
+      Urbanization_Rate +
+      Total_Literacy +
+      SC_Proportion +
+      ST_Proportion +
+      MGNREGA_Intensity +
+      Active_Worker_Rate,
+    
+    vardir = Direct_Var,
+    
+    data = boot_data
+  )
+  
+  # Bootstrap coefficients
+  beta_boot <-
+    boot_model$fit$estcoef$beta
+  
+  names(beta_boot) <-
+    rownames(
+      boot_model$fit$estcoef
+    )
+  
+  # Synthetic prediction for all districts
+  syn_boot <- as.vector(
+    X_all %*% beta_boot
+  )
+  
+  # Final FH prediction
+  FH_boot <- syn_boot
+  
+  FH_boot[sample_index] <-
+    as.vector(
+      boot_model$eblup
+    )
+  
+  FH_boot_matrix[, b] <-
+    FH_boot
+  
+  if (b %% 50 == 0) {
+    cat(
+      "Bootstrap =",
+      b,
+      "\n"
+    )
+  }
+}
+
+
+
+Boot_Estimate <- rowMeans(
+  FH_boot_matrix,
+  na.rm = TRUE
+)
+
+
+
+# BOOTSTRAP BIAS
+
+
+# Prediction error for each bootstrap replication
+
+Boot_Error <- FH_boot_matrix -
+  Theta_boot_matrix
+
+
+# Average prediction error
+Boot_Bias <- rowMeans(
+  Boot_Error,
+  na.rm = TRUE
+)
+
+
+# Absolute bias
+Boot_Absolute_Bias <- abs(
+  Boot_Bias
+)
+
+
+# Relative bias (%)
+
+Boot_Relative_Bias <- 100 *
+  Boot_Bias /
+  rowMeans(
+    Theta_boot_matrix,
+    na.rm = TRUE
+  )
+
+
+# Absolute relative bias (%)
+
+Boot_Absolute_Relative_Bias <- abs(
+  Boot_Relative_Bias
+)
+
+# BOOTSTRAP MSE
+
+
+Boot_MSE <- rowMeans(
+  Boot_Error^2,
+  na.rm = TRUE
+)
+
+# BOOTSTRAP RMSE
+Boot_RMSE <- sqrt(
+  Boot_MSE
+)
+
+# BOOTSTRAP CV
+
+
+Boot_CV <- 100 *
+  Boot_RMSE /
+  abs(Boot_Estimate)
+
+# ADD RESULTS TO FINAL DATASET
+
+final_data$FH_Boot_Estimate <-
+  Boot_Estimate
+
+final_data$FH_Boot_Bias <-
+  Boot_Bias
+
+final_data$FH_Boot_Absolute_Bias <-
+  Boot_Absolute_Bias
+
+final_data$FH_Boot_Relative_Bias <-
+  Boot_Relative_Bias
+
+final_data$FH_Boot_MSE <-
+  Boot_MSE
+
+final_data$FH_Boot_RMSE <-
+  Boot_RMSE
+
+final_data$FH_Boot_CV <-
+  Boot_CV
+
+
+# SFH Bootstrap Estimates
+
+dim(W_sample)
+rowSums(W_sample)
+W_sample <- W_sample / rowSums(W_sample)
+round(rowSums(W_sample), 5)
+rowSums(W_sample)
+isSymmetric(W)
+isSymmetric(W_sample)
+write.csv(
+  W,
+  "W.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  W_sample,
+  "W_sample.csv",
+  row.names = FALSE
+)
+
+sfh_model <- sae::eblupSFH(
+  
+  Direct_UR ~
+    
+    Mean_NTL +
+    
+    Urbanization_Rate +
+    
+    Total_Literacy +
+    
+    SC_Proportion +
+    
+    ST_Proportion +
+    
+    MGNREGA_Intensity +
+    
+    Active_Worker_Rate,
+  
+  vardir = Direct_Var,
+  
+  proxmat = W_sample,
+  
+  method = "REML",
+  
+  data = fh_data_df
+  
+)
+library(sae)
+library(Matrix)
+
+B <- 500
+
+M <- nrow(final_data_df)
+
+m <- nrow(fh_data_df)
+beta_hat <- sfh_model$fit$estcoef$beta
+beta_hat
+names(beta_hat) <- rownames(sfh_model$fit$estcoef)
+
+rho_hat <- sfh_model$fit$spatialcorr
+rho_hat
+sigma_u2 <- sfh_model$fit$refvar
+D <- fh_data$Direct_Var
+X_all <- model.matrix(
+  
+  ~ Mean_NTL +
+    Urbanization_Rate +
+    Total_Literacy +
+    SC_Proportion +
+    ST_Proportion +
+    MGNREGA_Intensity +
+    Active_Worker_Rate,
+  
+  data = final_data_df
+  
+)
+theta_hat <- as.vector(
+  
+  X_all %*% beta_hat
+  
+)
+sample_index <- !is.na(final_data_df$Direct_UR)
+Theta_boot_matrix <- matrix(
+  
+  NA,
+  
+  nrow=M,
+  
+  ncol=B
+  
+)
+
+SFH_boot_matrix <- matrix(
+  
+  NA,
+  
+  nrow=M,
+  
+  ncol=B
+  
+)
+I_M <- diag(M)
+set.seed(1234)
+
+successful <- 0
+
+for(b in 1:B){
+  
+  
+  eps <- rnorm(
+    
+    M,
+    
+    0,
+    
+    sqrt(sigma_u2)
+    
+  )
+  
+  A <- I_M - rho_hat*W
+  
+  if(kappa(A) > 10000){
+    
+    next
+    
+  }
+  
+  u <- solve(A,eps)
+  
+  theta.star <- theta_hat + u
+  
+  Theta_boot_matrix[,b] <- theta.star
+  
+  e <- rnorm(
+    
+    m,
+    
+    0,
+    
+    sqrt(D)
+    
+  )
+  
+
+  y.star <- theta.star[sample_index] + e
+  
+  boot.data <- fh_data_df
+  
+  boot.data$Direct_UR <- y.star
+  
+  fit.star <- try(
+    
+    eblupSFH(
+      
+      Direct_UR~
+        
+        Mean_NTL+
+        
+        Urbanization_Rate+
+        
+        Total_Literacy+
+        
+        SC_Proportion+
+        
+        ST_Proportion+
+        
+        MGNREGA_Intensity+
+        
+        Active_Worker_Rate,
+      
+      vardir=Direct_Var,
+      
+      proxmat=W_sample,
+      
+      method="REML",
+      
+      data=boot.data
+      
+    ),
+    
+    silent=TRUE
+    
+  )
+  
+  if(inherits(fit.star,"try-error")){
+    
+    next
+    
+  }
+  
+  #Skip unstable rho
+  
+  rho.star <- fit.star$fit$spatialcorr
+  
+  if(abs(rho.star)>=0.99){
+    
+    next
+    
+  }
+  
+  beta.star <- fit.star$fit$estcoef$beta
+  
+  names(beta.star) <- rownames(
+    
+    fit.star$fit$estcoef
+    
+  )
+  
+  
+  syn.star <- as.vector(
+    
+    X_all %*% beta.star
+    
+  )
+  
+  sfh.temp <- syn.star
+  
+  sfh.temp[sample_index] <-
+    
+    as.vector(fit.star$eblup)
+  
+  SFH_boot_matrix[,b] <- sfh.temp
+  
+  successful <- successful + 1
+  
+  if(successful%%25==0)
+    
+    cat("Successful bootstrap =",successful,"\n")
+  
+}
+
+# KEEP ONLY SUCCESSFUL BOOTSTRAP REPLICATIONS
+
+good <- colSums(
+  is.na(SFH_boot_matrix)
+) == 0
+
+SFH_boot_matrix <- SFH_boot_matrix[, good]
+
+Theta_boot_matrix <- Theta_boot_matrix[, good]
+
+B_success <- ncol(SFH_boot_matrix)
+
+cat(
+  "Successful SFH bootstrap replications =",
+  B_success,
+  "\n"
+)
+
+# BOOTSTRAP PREDICTION ERROR
+
+SFH_Boot_Error <-
+  SFH_boot_matrix -
+  Theta_boot_matrix
+
+SFH_Boot_Estimate <-
+  rowMeans(
+    SFH_boot_matrix,
+    na.rm = TRUE
+  )
+SFH_Boot_Estimate
+
+SFH_Boot_Bias <-
+  rowMeans(
+    SFH_Boot_Error,
+    na.rm = TRUE
+  )
+
+SFH_Boot_Absolute_Bias <-
+  abs(
+    SFH_Boot_Bias
+  )
+
+SFH_Boot_Relative_Bias <-
+  100 *
+  SFH_Boot_Bias /
+  rowMeans(
+    Theta_boot_matrix,
+    na.rm = TRUE
+  )
+
+SFH_Boot_Absolute_Relative_Bias <-
+  abs(
+    SFH_Boot_Relative_Bias
+  )
+
+
+SFH_Boot_MSE <-
+  rowMeans(
+    SFH_Boot_Error^2,
+    na.rm = TRUE
+  )
+
+SFH_Boot_MSE
+
+SFH_Boot_RMSE <-
+  sqrt(
+    SFH_Boot_MSE
+  )
+
+SFH_Boot_CV <-
+  100 *
+  SFH_Boot_RMSE /
+  abs(
+    SFH_Boot_Estimate
+  )
+SFH_Boot_CV
+
+final_data$SFH_Boot_Estimate <-
+  SFH_Boot_Estimate
+
+final_data$SFH_Boot_Bias <-
+  SFH_Boot_Bias
+
+final_data$SFH_Boot_Absolute_Bias <-
+  SFH_Boot_Absolute_Bias
+
+final_data$SFH_Boot_Relative_Bias <-
+  SFH_Boot_Relative_Bias
+
+final_data$SFH_Boot_Absolute_Relative_Bias <-
+  SFH_Boot_Absolute_Relative_Bias
+
+final_data$SFH_Boot_MSE <-
+  SFH_Boot_MSE
+
+final_data$SFH_Boot_RMSE <-
+  SFH_Boot_RMSE
+
+final_data$SFH_Boot_CV <-
+  SFH_Boot_CV
+
+
